@@ -1,12 +1,14 @@
 """
 fetch_jobs.py — pulls postings from the Adzuna API.
 
-Adzuna is used because it has a legitimate public API, real salary data, and a
-free tier. We do NOT scrape LinkedIn/Indeed (against their terms and brittle).
+Uses `what_phrase` (exact-phrase match) and hits Adzuna once per cluster
+phrase to avoid the noise from word-level OR matching. Each phrase gets two
+passes: Indianapolis + radius, and a remote-keyword pass. Results are merged
+and de-duplicated by Adzuna's job id.
 
-For each title cluster we run two passes: one anchored on Indianapolis (with a
-distance radius) and one keyword pass for remote roles. Results are merged and
-de-duplicated by Adzuna's job id before being returned.
+A belt-and-suspenders title check verifies each returned posting's title
+actually contains a cluster phrase — drops anything Adzuna matched on
+description-only text.
 """
 
 import os
@@ -50,13 +52,11 @@ def _query(params):
         if resp.status_code in (429, 500, 502, 503):
             time.sleep(2 * (attempt + 1))
             continue
-        # Anything else (auth, malformed query) — fail loudly.
         resp.raise_for_status()
     return []
 
 
-def _normalize(raw, cluster, location_pass):
-    """Flatten Adzuna's nested shape into the dict the rest of the app expects."""
+def _normalize(raw, cluster, location_pass, matched_phrase):
     salary_min = raw.get("salary_min")
     salary_max = raw.get("salary_max")
     return {
@@ -73,46 +73,53 @@ def _normalize(raw, cluster, location_pass):
         "cluster": cluster["name"],
         "cluster_priority": cluster["priority"],
         "require_sales_component": cluster.get("require_sales_component", False),
-        "location_pass": location_pass,  # "indianapolis" or "remote"
+        "location_pass": location_pass,
+        "matched_phrase": matched_phrase,
     }
 
 
+def _title_contains_any_phrase(title, phrases):
+    lower = title.lower()
+    return any(p.lower() in lower for p in phrases)
+
+
 def fetch_all():
-    """Return a de-duplicated list of normalized job dicts across all clusters."""
     seen_ids = set()
     jobs = []
 
     for cluster in config.TITLE_CLUSTERS:
-        # Pass 1: Indianapolis + radius
-        indy = _query({
-            "what_or": cluster["what_or"],
-            "where": config.INDY_LOCATION,
-            "distance": config.INDY_DISTANCE_KM,
-        })
-        # Pass 2: remote keyword
-        remote = _query({
-            "what_or": cluster["what_or"] + " " + config.REMOTE_KEYWORDS,
-            "where": config.REMOTE_KEYWORDS,
-        })
+        phrases = cluster["title_phrases"]
+        for phrase in phrases:
+            indy = _query({
+                "what_phrase": phrase,
+                "where": config.INDY_LOCATION,
+                "distance": config.INDY_DISTANCE_KM,
+            })
+            remote = _query({
+                "what_phrase": phrase,
+                "where": config.REMOTE_KEYWORDS,
+            })
 
-        for raw, location_pass in (
-            [(r, "indianapolis") for r in indy]
-            + [(r, "remote") for r in remote]
-        ):
-            jid = str(raw.get("id"))
-            if jid in seen_ids:
-                continue
-            seen_ids.add(jid)
-            jobs.append(_normalize(raw, cluster, location_pass))
+            for raw, location_pass in (
+                [(r, "indianapolis") for r in indy]
+                + [(r, "remote") for r in remote]
+            ):
+                jid = str(raw.get("id"))
+                if jid in seen_ids:
+                    continue
+                title = (raw.get("title") or "").strip()
+                if not _title_contains_any_phrase(title, phrases):
+                    continue
+                seen_ids.add(jid)
+                jobs.append(_normalize(raw, cluster, location_pass, phrase))
 
     return jobs
 
 
 if __name__ == "__main__":
-    # Quick local test:  python src/fetch_jobs.py
     found = fetch_all()
-    print(f"Fetched {len(found)} unique postings.")
-    for j in found[:10]:
+    print(f"Fetched {len(found)} unique on-target postings.")
+    for j in found[:15]:
         salary = (
             f"${int(j['salary_min']):,}+" if j["salary_min"]
             else "salary not listed"
