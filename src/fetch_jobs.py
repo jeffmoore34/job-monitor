@@ -41,7 +41,6 @@ def _query(params):
         "content-type": "application/json",
         "results_per_page": config.RESULTS_PER_PAGE,
         "max_days_old": config.MAX_DAYS_OLD,
-        "salary_min": config.SALARY_MIN,
         "sort_by": "date",
         **params,
     }
